@@ -1,0 +1,374 @@
+name: Base Infra CI/CD — Autonomous SRE
+
+on:
+  push:
+    branches: [main, "fix/*"]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: "1.7.0"
+  REPO_NAME: repo1-base-infra
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # STAGE 1 — Pre-merge dependency prediction (Claude API)
+  # ──────────────────────────────────────────────────────────────────────────
+  dependency-prediction:
+    name: "Stage 1 · Dependency Prediction"
+    runs-on: ubuntu-latest
+    outputs:
+      impact_report: ${{ steps.predict.outputs.impact_report }}
+      safe_to_proceed: ${{ steps.predict.outputs.safe_to_proceed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changed
+        run: |
+          git diff --name-only HEAD~1 HEAD > /tmp/changed_files.txt
+          echo "files=$(cat /tmp/changed_files.txt | tr '\n' ',')" >> $GITHUB_OUTPUT
+
+      - name: Predict cross-repo impact with Claude
+        id: predict
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, json, urllib.request, urllib.parse
+
+          changed_files = """${{ steps.changed.outputs.files }}"""
+          repo = os.environ.get("REPO_NAME", "repo1-base-infra")
+
+          prompt = f"""You are a cross-repo dependency analyzer for an AWS ECS deployment system.
+
+          Repository: {repo}
+          Changed files: {changed_files}
+
+          This repository (Repo 1 - Base Infra) is depended on by:
+          - Repo 2 (App Infra): reads vpc_id, subnet_ids, security_group_ids, ecs_cluster_name via remote state
+          - Repo 3 (Frontend): reads ALB DNS name and ECS cluster ARN
+          - Repo 4 (Backend API): reads ECS cluster ARN and task execution role ARN
+
+          Dependency graph:
+          Repo1 → Repo2 → Repo3
+                        → Repo4
+
+          Analyze the changed files and respond ONLY with a JSON object (no markdown):
+          {{
+            "safe_to_proceed": true/false,
+            "blast_radius": ["repo2", "repo3", "repo4"] (only affected repos),
+            "risk_level": "LOW|MEDIUM|HIGH|CRITICAL",
+            "summary": "one sentence summary",
+            "warnings": ["list of specific warnings"],
+            "recommendation": "what to do"
+          }}"""
+
+          payload = json.dumps({
+              "model": "claude-sonnet-4-20250514",
+              "max_tokens": 1000,
+              "messages": [{"role": "user", "content": prompt}]
+          }).encode()
+
+          req = urllib.request.Request(
+              "https://api.anthropic.com/v1/messages",
+              data=payload,
+              headers={
+                  "Content-Type": "application/json",
+                  "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                  "anthropic-version": "2023-06-01"
+              }
+          )
+          with urllib.request.urlopen(req) as resp:
+              data = json.loads(resp.read())
+
+          text = data["content"][0]["text"]
+          clean = text.strip()
+          if clean.startswith("```"):
+              clean = clean.split("```")[1]
+              if clean.startswith("json"):
+                  clean = clean[4:]
+          result = json.loads(clean.strip())
+
+          print(f"=== DEPENDENCY IMPACT REPORT ===")
+          print(json.dumps(result, indent=2))
+          print(f"================================")
+
+          # Write outputs
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"safe_to_proceed={str(result['safe_to_proceed']).lower()}\n")
+              f.write(f"impact_report={json.dumps(result)}\n")
+
+          # Fail if critical
+          if result["risk_level"] == "CRITICAL":
+              print("::error::CRITICAL blast radius detected — blocking merge")
+              exit(1)
+          PYEOF
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # STAGE 2 — Terraform Plan
+  # ──────────────────────────────────────────────────────────────────────────
+  terraform-plan:
+    name: "Stage 2 · Terraform Plan"
+    runs-on: ubuntu-latest
+    needs: dependency-prediction
+    outputs:
+      plan_exitcode: ${{ steps.plan.outputs.exitcode }}
+      plan_output: ${{ steps.plan.outputs.plan_output }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -input=false -detailed-exitcode -out=tfplan 2>&1 | tee /tmp/plan_output.txt
+          EXITCODE=$?
+          echo "exitcode=$EXITCODE" >> $GITHUB_OUTPUT
+          PLAN_OUTPUT=$(cat /tmp/plan_output.txt | tail -50)
+          echo "plan_output<<EOF" >> $GITHUB_OUTPUT
+          echo "$PLAN_OUTPUT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          # exitcode 2 = changes present (not failure), 1 = error
+          if [ $EXITCODE -eq 1 ]; then exit 1; fi
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tfplan
+          path: tfplan
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # STAGE 3 — Self-Heal on failure (Claude generates fix, raises PR)
+  # ──────────────────────────────────────────────────────────────────────────
+  self-heal:
+    name: "Stage 3 · Self-Heal"
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    if: failure() && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Collect failure context
+        id: context
+        run: |
+          echo "stage=terraform-plan" >> $GITHUB_OUTPUT
+          echo "plan_output=${{ needs.terraform-plan.outputs.plan_output }}" >> $GITHUB_OUTPUT
+
+      - name: Claude self-heal analysis
+        id: heal
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Capture all TF files for context
+          TF_CONTENT=""
+          for f in *.tf; do
+            TF_CONTENT+="=== $f ===\n$(cat $f)\n\n"
+          done
+
+          python3 - <<'PYEOF'
+          import os, json, urllib.request, subprocess, datetime
+
+          tf_content = ""
+          import glob
+          for f in glob.glob("*.tf"):
+              with open(f) as fp:
+                  tf_content += f"=== {f} ===\n{fp.read()}\n\n"
+
+          error_context = """${{ needs.terraform-plan.outputs.plan_output }}"""
+
+          prompt = f"""You are an expert Terraform SRE. A Terraform plan/validate step failed in a CI/CD pipeline.
+
+          Repository: repo1-base-infra (provisions VPC, Subnets, ECS Cluster on AWS)
+          Failed stage: terraform-plan
+
+          ERROR OUTPUT:
+          {error_context[:3000]}
+
+          CURRENT TERRAFORM FILES:
+          {tf_content[:4000]}
+
+          Your job:
+          1. Identify the root cause of the failure
+          2. Produce the exact file patches needed to fix it
+          3. Return ONLY valid JSON, no markdown:
+
+          {{
+            "root_cause": "brief description",
+            "fix_description": "what you changed and why",
+            "file_patches": [
+              {{
+                "filename": "main.tf",
+                "search": "exact string to find (must be unique in file)",
+                "replace": "replacement string"
+              }}
+            ],
+            "commit_message": "fix: <description>"
+          }}
+
+          If the error is not fixable via code change (e.g. missing AWS credentials), set file_patches to [] and explain in root_cause."""
+
+          payload = json.dumps({
+              "model": "claude-sonnet-4-20250514",
+              "max_tokens": 1000,
+              "messages": [{"role": "user", "content": prompt}]
+          }).encode()
+
+          req = urllib.request.Request(
+              "https://api.anthropic.com/v1/messages",
+              data=payload,
+              headers={
+                  "Content-Type": "application/json",
+                  "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                  "anthropic-version": "2023-06-01"
+              }
+          )
+          with urllib.request.urlopen(req) as resp:
+              data = json.loads(resp.read())
+
+          text = data["content"][0]["text"]
+          clean = text.strip()
+          if "```" in clean:
+              clean = clean.split("```")[1]
+              if clean.startswith("json"): clean = clean[4:]
+          fix = json.loads(clean.strip())
+
+          print(json.dumps(fix, indent=2))
+
+          # Apply patches
+          patches_applied = 0
+          for patch in fix.get("file_patches", []):
+              fname = patch["filename"]
+              if not os.path.exists(fname):
+                  print(f"WARNING: {fname} not found, skipping patch")
+                  continue
+              with open(fname, "r") as fp:
+                  content = fp.read()
+              if patch["search"] in content:
+                  new_content = content.replace(patch["search"], patch["replace"], 1)
+                  with open(fname, "w") as fp:
+                      fp.write(new_content)
+                  patches_applied += 1
+                  print(f"Patched {fname}")
+              else:
+                  print(f"WARNING: search string not found in {fname}")
+
+          # Write outputs for git step
+          with open("/tmp/fix_summary.txt", "w") as fp:
+              fp.write(f"root_cause: {fix['root_cause']}\n")
+              fp.write(f"fix: {fix['fix_description']}\n")
+              fp.write(f"patches_applied: {patches_applied}\n")
+
+          with open("/tmp/commit_msg.txt", "w") as fp:
+              fp.write(fix.get("commit_message", "fix: auto-heal by autonomous SRE"))
+
+          print(f"Patches applied: {patches_applied}")
+          PYEOF
+
+      - name: Create fix branch and PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="fix/auto-heal-$(date +%Y%m%d-%H%M%S)"
+          COMMIT_MSG=$(cat /tmp/commit_msg.txt 2>/dev/null || echo "fix: auto-heal by autonomous SRE")
+          FIX_SUMMARY=$(cat /tmp/fix_summary.txt 2>/dev/null || echo "Auto-generated fix")
+
+          git config user.name "Autonomous SRE Bot"
+          git config user.email "sre-bot@autonomous-sre.io"
+          git checkout -b "$BRANCH"
+          git add -A
+          git diff --staged --quiet || git commit -m "$COMMIT_MSG"
+          git push origin "$BRANCH"
+
+          # Create PR via gh CLI
+          gh pr create \
+            --title "🤖 Auto-heal: $COMMIT_MSG" \
+            --body "## Autonomous SRE Self-Heal
+
+          **Triggered by:** Failed terraform-plan stage on \`main\`
+          **Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          ### Root Cause & Fix
+          \`\`\`
+          $FIX_SUMMARY
+          \`\`\`
+
+          ### Impact Report
+          \`\`\`json
+          ${{ needs.dependency-prediction.outputs.impact_report }}
+          \`\`\`
+
+          > ⚠️ Review carefully before merging. This PR was generated by Claude (autonomous-sre)." \
+            --head "$BRANCH" \
+            --base main \
+            --label "auto-heal" || echo "PR creation failed (may already exist)"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # STAGE 4 — Terraform Apply (only on main, only if plan succeeded)
+  # ──────────────────────────────────────────────────────────────────────────
+  terraform-apply:
+    name: "Stage 4 · Deploy"
+    runs-on: ubuntu-latest
+    needs: [dependency-prediction, terraform-plan]
+    if: github.ref == 'refs/heads/main' && needs.terraform-plan.outputs.plan_exitcode != '1'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Apply
+        run: terraform apply -input=false -auto-approve tfplan
+
+      - name: Emit dependency graph update
+        run: |
+          echo "Repo1 outputs updated. Downstream repos (Repo2) will pick up new state on next run."
+          terraform output -json > /tmp/repo1_outputs.json
+          cat /tmp/repo1_outputs.json
