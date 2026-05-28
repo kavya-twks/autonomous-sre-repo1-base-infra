@@ -4,9 +4,11 @@ terraform {
     aws = { source = "hashicorp/aws", version = "~> 5.0" }
   }
   backend "s3" {
-    bucket = "autonomous-sre-tfstate"
-    key    = "base-infra/terraform.tfstate"
-    region = "us-east-1"
+    bucket         = "autonomous-sre-tfstate"
+    key            = "base-infra/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "autonomous-sre-tflock"
+    encrypt        = true
   }
 }
 
@@ -143,9 +145,7 @@ resource "aws_iam_role" "ecs_task_execution" {
 resource "aws_iam_role_policy_attachment" "ecs_execution" {
   role       = aws_iam_role.ecs_task_execution.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
-}  = aws_iam_role.ecs_task_execution.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
-}
+}  
 
 # CloudWatch log group for ECS
 resource "aws_cloudwatch_log_group" "ecs" {
