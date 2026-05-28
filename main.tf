@@ -86,7 +86,7 @@ resource "aws_security_group" "alb" {
 
 resource "aws_security_group" "ecs_tasks" {
   name        = "${var.project}-ecs-tasks-sg"
-  description = "ECS tasks — allow from ALB only"
+  description = "ECS tasks allow from ALB only"
   vpc_id      = aws_vpc.main.id
 
   ingress {
